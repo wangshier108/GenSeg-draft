@@ -74,7 +74,10 @@ class EDSR(nn.Module):
     def forward(self, x):
         x = self.head(x)
         res = self.body(x)
+        # print("why sr   00000")
         x = x + res
         x = self.upsampler(x)
+        # print("why sr   11111")
         x = self.tail(x)
+        # print("why sr   22222")
         return x

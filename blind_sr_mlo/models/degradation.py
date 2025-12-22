@@ -270,9 +270,12 @@ class DegradationGenerator(nn.Module):
     def forward(self, hr):
         feat = self.encoder(hr)
         kernel = self.blur_head(feat)
+        # print("why degra   00000")
         sigma, mu = self.noise_head(feat, hr_size=hr.shape[-2:])
         qf = self.comp_head(feat)
+        # print("why degra   11111")
         lr = self.degradation(hr, kernel, sigma, mu, qf)
+        # print("why degra   22222")
         return lr, kernel, sigma, mu, qf
 
 
