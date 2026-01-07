@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import models
 import math
+import argparse
 
 def _gaussian_window(window_size: int, sigma: float, device: torch.device):
     gauss = torch.tensor([math.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)], device=device)
@@ -188,63 +189,113 @@ class SRProblem(ImplicitProblem):
         self.adv_loss = nn.BCEWithLogitsLoss()
         self.discriminator = None
         self.optim_D = None
+        self.deg_module = None  # optional: generate synthetic LR for extra supervision
+        self.real_branch_weight = 1.0
+        self.fake_branch_weight_max = 0.6
+        self.fake_branch_ramp = 2000  # steps to reach max
 
     def set_discriminator(self, discriminator: nn.Module, optim_D: torch.optim.Optimizer):
         self.discriminator = discriminator
         self.optim_D = optim_D
 
+    def set_degradation(self, deg_module: nn.Module):
+        # Used to generate lr_syn from hr for additional fake branch supervision
+        self.deg_module = deg_module
+
+    def set_branch_weights(self, real_w: float = 1.0, fake_w_max: float = 0.6, ramp_steps: int = 2000):
+        # Weight real vs fake branch; fake ramp-up over ramp_steps
+        self.real_branch_weight = float(real_w)
+        self.fake_branch_weight_max = float(fake_w_max)
+        self.fake_branch_ramp = max(1, int(ramp_steps))
+
     def training_step(self, batch: Dict[str, Any]):
-        lr = batch["lr"].to(self.device)
+        lr_real = batch["lr"].to(self.device)
         hr = batch["hr"].to(self.device)
-        sr = self.module(lr)
+        sr_real = self.module(lr_real)
+
+        sr_list = [sr_real]
+        lr_tags = ["real"]
+        # 动态 fake 权重：随 global_step 线性上升到上限
+        gs = getattr(self, "global_step", 0)
+        fake_w = self.fake_branch_weight_max * min(1.0, gs / float(self.fake_branch_ramp))
+        w_list = [self.real_branch_weight]
+
+        # 可选：使用退化生成器产生 lr_syn，形成 fake 分支，增强监督
+        if self.deg_module is not None:
+            with torch.no_grad():
+                lr_syn, _, _, _, _ = self.deg_module(hr)
+                if lr_syn.shape[-2:] != lr_real.shape[-2:]:
+                    lr_syn = nn.functional.interpolate(
+                        lr_syn, size=lr_real.shape[-2:], mode="bicubic", align_corners=False
+                    )
+            sr_fake = self.module(lr_syn)
+            sr_list.append(sr_fake)
+            lr_tags.append("fake")
+            w_list.append(fake_w)
 
         # PSNR / SSIM 计算（数据范围假定 0-1）
         with torch.no_grad():
-            mse = torch.mean((sr.clamp(0, 1) - hr.clamp(0, 1)) ** 2)
+            mse = torch.mean((sr_real.clamp(0, 1) - hr.clamp(0, 1)) ** 2)
             psnr = 10.0 * torch.log10(1.0 / (mse + 1e-8))
-            # SSIM 使用固定窗口，避免额外依赖
-            ssim = _ssim(sr.clamp(0, 1), hr.clamp(0, 1))
+            # SSIM 使用固定窗口，避免额外依赖（统计 real 分支）
+            ssim = _ssim(sr_real.clamp(0, 1), hr.clamp(0, 1))
 
-        # L1
-        l_l1 = self.l1(sr, hr)
-        # 感知损失（近似 LPIPS）
-        l_perc = self.perc(sr, hr)
+        l1_list, perc_list, gan_list = [], [], []
 
         # PatchGAN 判别器更新
         if self.discriminator is not None and self.optim_D is not None:
             self.discriminator.train()
             self.optim_D.zero_grad()
-            with torch.no_grad():
-                sr_detach = sr.detach()
-            pred_real = self.discriminator(hr)
-            pred_fake = self.discriminator(sr_detach)
-            real_labels = torch.ones_like(pred_real)
-            fake_labels = torch.zeros_like(pred_fake)
-            loss_D = 0.5 * (
-                self.adv_loss(pred_real, real_labels) + self.adv_loss(pred_fake, fake_labels)
-            )
+            pred_real_img = self.discriminator(hr)
+            real_labels = torch.ones_like(pred_real_img)
+            fake_labels = torch.zeros_like(pred_real_img)
+
+            loss_D_terms = []
+            fake_weights = []
+            for sr_item, w in zip(sr_list, w_list):
+                with torch.no_grad():
+                    sr_detach = sr_item.detach()
+                pred_fake = self.discriminator(sr_detach)
+                loss_D_terms.append(self.adv_loss(pred_fake, fake_labels) * w)
+                fake_weights.append(w)
+            sum_w_fake = max(1e-8, torch.tensor(fake_weights, device=self.device).sum())
+            loss_D_fake = torch.stack(loss_D_terms).sum() / sum_w_fake
+            loss_D = 0.5 * (self.adv_loss(pred_real_img, real_labels) + loss_D_fake)
             loss_D.backward(retain_graph=True)
             self.optim_D.step()
 
-            pred_fake_for_G = self.discriminator(sr)
-            l_gan = self.adv_loss(pred_fake_for_G, real_labels)
+            # GAN loss for generator on all branches
+            pred_fake_for_G_terms = []
+            gan_weights = []
+            for sr_item, w in zip(sr_list, w_list):
+                pred_fake_for_G_terms.append(self.discriminator(sr_item))
+                gan_weights.append(w)
+            sum_w_gan = max(1e-8, torch.tensor(gan_weights, device=self.device).sum())
+            l_gan = torch.stack([self.adv_loss(p, real_labels) * w for p, w in zip(pred_fake_for_G_terms, gan_weights)]).sum() / sum_w_gan
         else:
-            l_gan = 0.0
+            l_gan = torch.tensor(0.0, device=self.device)
+
+        # 汇总各分支的 L1/LPIPS
+        for sr_item, w in zip(sr_list, w_list):
+            l1_i = self.l1(sr_item, hr) * w
+            perc_i = self.perc(sr_item, hr) * w
+            l1_list.append(l1_i)
+            perc_list.append(perc_i)
+        sum_w = max(1e-8, torch.tensor(w_list, device=self.device).sum())
+        total_l1 = torch.stack(l1_list).sum() / sum_w
+        total_perc = torch.stack(perc_list).sum() / sum_w
 
         # L② = λ1 L1 + λ2 LPIPS + λ3 LGAN
-        loss = 1.0 * l_l1 + 0.1 * l_perc + 0.01 * l_gan
-        # 记录最近的损失用于进度打印
-        try:
-            gan_val = l_gan.item() if hasattr(l_gan, "item") else float(l_gan)
-        except Exception:
-            gan_val = 0.0
+        loss = 1.0 * total_l1 + 0.1 * total_perc + 0.01 * l_gan
+
         self._last_metrics = {
-            "l1": float(l_l1.item()),
-            "perc": float(l_perc.item()),
-            "gan": gan_val,
+            "l1": float(total_l1.item()),
+            "perc": float(total_perc.item()),
+            "gan": float(l_gan.item()) if hasattr(l_gan, "item") else 0.0,
             "psnr": float(psnr.item()),
             "ssim": float(ssim.item()),
             "total": float(loss.item()),
+            "branches": lr_tags,
         }
         return loss
 
@@ -252,11 +303,12 @@ class SRProblem(ImplicitProblem):
 class ArchProblem(ImplicitProblem):
     """外层 NAS 问题：在验证集上最小化 L_val，对架构参数（G 中的 MixedOp 等）做优化。"""
 
-    def __init__(self, *args, sr_model: nn.Module = None, **kwargs):
+    def __init__(self, *args, sr_model: nn.Module = None, scale: int = 2, **kwargs):
         super().__init__(*args, **kwargs)
         self.sr_model = sr_model
         self.l1 = nn.L1Loss()
         self.perc = VGGPerceptualLoss().to(self.device)
+        self.scale = scale
 
     def training_step(self, batch: Dict[str, Any]):
         hr = batch["hr"].to(self.device)
@@ -269,8 +321,8 @@ class ArchProblem(ImplicitProblem):
             target_size = lr_real.shape[-2:]
         else:
             h, w = hr.shape[-2], hr.shape[-1]
-            # Fallback assumes scale=4 as used by EDSR in this script
-            target_size = (h // 4, w // 4)
+            # Fallback assumes provided scale
+            target_size = (max(1, h // getattr(self, "scale", 4)), max(1, w // getattr(self, "scale", 4)))
         if lr_syn.shape[-2:] != target_size:
             lr_syn = nn.functional.interpolate(
                 lr_syn, size=target_size, mode="bicubic", align_corners=False
@@ -389,9 +441,34 @@ class MLOEngine(Engine):
                     continue
 
 
-def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: torch.device):
+def build_mlo_engine(
+    train_loader_deg: DataLoader,
+    train_loader_sr: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    pretrained_g: str | None = None,
+    scale: int = 2,
+):
     # 退化生成器 G
     G = DegradationGenerator().to(device)
+    # 可选加载 Stage1 预训练权重
+    if pretrained_g and os.path.exists(pretrained_g):
+        state = torch.load(pretrained_g, map_location=device)
+        g_sd = None
+        if isinstance(state, dict):
+            # 兼容 stage1 保存 {"G": ...} 或完整 ckpt
+            if "G" in state:
+                g_sd = state["G"]
+            elif "problems" in state and "deg" in state["problems"]:
+                g_sd = state["problems"]["deg"].get("module") or state["problems"]["deg"].get("module_state")
+            elif "module_state" in state:
+                g_sd = state["module_state"]
+        if g_sd:
+            missing, unexpected = G.load_state_dict(g_sd, strict=False)
+            print(f"[Init] Loaded pretrained G from {pretrained_g}, missing={len(missing)}, unexpected={len(unexpected)}")
+        else:
+            print(f"[Init] Found checkpoint {pretrained_g} but no G weights were loaded.")
+
     optim_G = torch.optim.Adam(G.parameters(), lr=1e-4)
 
     # 退化 PatchGAN 判别器
@@ -399,7 +476,7 @@ def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: t
     optim_D_deg = torch.optim.Adam(D_deg.parameters(), lr=1e-4)
 
     # 超分网络 S
-    S = EDSR(scale=4).to(device)
+    S = EDSR(scale=scale).to(device)
     optim_S = torch.optim.Adam(S.parameters(), lr=1e-4)
 
     # 超分 PatchGAN 判别器
@@ -425,7 +502,7 @@ def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: t
         name="deg",
         module=G,
         optimizer=optim_G,
-        train_data_loader=train_loader,
+        train_data_loader=train_loader_deg,
         config=inner_cfg,
         discriminator=D_deg,
         optim_D=optim_D_deg,
@@ -434,10 +511,13 @@ def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: t
         name="sr",
         module=S,
         optimizer=optim_S,
-        train_data_loader=train_loader,
+        train_data_loader=train_loader_sr,
         config=inner_cfg,
     )
     sr_problem.set_discriminator(D_sr, optim_D_sr)
+    sr_problem.set_degradation(G)
+    # fake 分支权重随步数线性上升至 0.6，前 2000 步完成
+    sr_problem.set_branch_weights(real_w=1.0, fake_w_max=0.6, ramp_steps=2000)
     arch_problem = ArchProblem(
         name="arch",
         module=G,
@@ -445,6 +525,7 @@ def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: t
         train_data_loader=val_loader,
         config=outer_cfg,
         sr_model=S,
+        scale=scale,
     )
 
     problems = [deg_problem, sr_problem, arch_problem]
@@ -462,42 +543,53 @@ def build_mlo_engine(train_loader: DataLoader, val_loader: DataLoader, device: t
 
 
 def main():
-    # 这里只放占位的数据加载逻辑，实际使用时请替换为 DIV2K/Flickr2K/RealSR 等数据集的 DataLoader.
-    # 为了保证脚本可运行，我们使用随机张量的 DummyDataset.
-    from torch.utils.data import Dataset
+    parser = argparse.ArgumentParser(description="Stage2: joint training with pretrained degradation")
+    parser.add_argument("--hr_dir", type=str, required=False, help="SR train HR (Track2 train HR, paired with --lr_dir)")
+    parser.add_argument("--lr_dir", type=str, required=False, help="SR train LR (Track2 train LR, paired with --hr_dir)")
+    parser.add_argument("--hr_val_dir", type=str, required=False, help="Arch/val HR (Track2 val HR, paired with --lr_val_dir)")
+    parser.add_argument("--lr_val_dir", type=str, required=False, help="Arch/val LR (Track2 val LR, paired with --hr_val_dir)")
+    parser.add_argument("--lr_bank_dir", type=str, required=False, help="Deg LR bank (unpaired, e.g., NTIRE 2018/2017 Track2 LR train)")
+    parser.add_argument("--scale", type=int, default=2, help="SR upscale factor (e.g., 2 for Track2 X2)")
+    parser.add_argument("--hr_patch_size", type=int, default=256, help="HR patch size for SR/val aligned cropping")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--iters", type=int, default=10000)
+    parser.add_argument("--pretrained_g", type=str, default="running_files/stage1_deg/deg_final.pt")
+    parser.add_argument("--device", type=str, default="cuda")
+    args = parser.parse_args()
 
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    class DummySRDataset(Dataset):
-        def __init__(self, length=1000, hr_size=(256, 256)):
-            self.length = length
-            self.hr_size = hr_size
+    # 数据集选择：
+    # deg: 继续使用 LR bank 的非配对分布（保持 Stage1 退化分布）；若无 bank，则退化到配对数据
+    # sr: 使用配对的 Track2 train (HR/LR)
+    # arch/val: 使用 Track2 val (HR/LR)
+    from blind_sr_mlo.datasets.sr_datasets import PairedImageFolders, UnpairedHRLRDataset
 
-        def __len__(self):
-            return self.length
+    # 必须提供真实数据路径：SR/Arch 用配对 Track2，Deg 继续用 Stage1 的 HR + LR bank 分布
+    if not (args.hr_dir and args.lr_dir):
+        raise ValueError("SR train set requires --hr_dir and --lr_dir (paired Track2 train).")
+    if not (args.hr_val_dir and args.lr_val_dir):
+        raise ValueError("Arch/val set requires --hr_val_dir and --lr_val_dir (paired Track2 val).")
+    if not (args.hr_dir and args.lr_bank_dir):
+        raise ValueError("Deg set requires --hr_dir and --lr_bank_dir (Stage1 LR bank).")
 
-        def __getitem__(self, idx):
-            h, w = self.hr_size
-            hr = torch.rand(3, h, w)
-            # 这里先简单生成一个下采样 LR，真实场景中会用真实 LR_real
-            lr = nn.functional.interpolate(hr.unsqueeze(0), scale_factor=0.25, mode="bicubic", align_corners=False).squeeze(0)
-            return {"hr": hr, "lr": lr}
+    train_set_sr = PairedImageFolders(args.hr_dir, args.lr_dir, hr_patch_size=args.hr_patch_size, scale=args.scale, train=True)
+    val_set = PairedImageFolders(args.hr_val_dir, args.lr_val_dir, hr_patch_size=args.hr_patch_size, scale=args.scale, train=False)
+    print("[Stage2] Deg uses unpaired HR (--hr_dir) + LR bank (--lr_bank_dir). SR uses paired Track2 train (--hr_dir/--lr_dir); val uses Track2 val (--hr_val_dir/--lr_val_dir).")
+    train_set_deg = UnpairedHRLRDataset(hr_root=args.hr_dir, lr_root=args.lr_bank_dir, scale=args.scale, hr_patch_size=256, augment=True)
+    train_loader_sr = DataLoader(train_set_sr, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    train_loader_deg = DataLoader(train_set_deg, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    val_loader = DataLoader(val_set, batch_size=max(1, args.batch_size // 2), shuffle=False, num_workers=args.num_workers)
 
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    from datasets.sr_datasets import PairedImageFolders
-    stage1_hr_folder = "/data/hanying/DIV2K_train_HR/"
-    stage1_lr_folder = ""
-    train_set = PairedImageFolders()
-    train_set = DummySRDataset(length=500)
-    val_set = DummySRDataset(length=50)
-    train_loader = DataLoader(train_set, batch_size=4, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=2)
-
-    engine = build_mlo_engine(train_loader, val_loader, device)
+    engine = build_mlo_engine(train_loader_deg, train_loader_sr, val_loader, device, pretrained_g=args.pretrained_g, scale=args.scale)
+    engine.config.train_iters = args.iters
+    print(f"[Stage2] Joint training with pretrained G from {args.pretrained_g}, iters={args.iters}")
     engine.run()
 
 
 if __name__ == "__main__":
+    import argparse
     main()
 
 
